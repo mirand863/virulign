@@ -4,9 +4,16 @@
 #include <vector>
 #include <stdexcept>
 #include <iomanip>
+#ifdef _OPENMP
+   #include <omp.h>
+#else
+   #define omp_get_thread_num() 0
+#endif
 
 #include <NeedlemanWunsh.h>
 
+#include "cursor_control.cpp"
+#include "progress_bar.cpp"
 #include "ReferenceSequence.h"
 #include "Alignment.h"
 #include "ResultsExporter.h"
@@ -37,6 +44,7 @@ int main(int argc, char **argv) {
 	      << "  --gapOpenPenalty doubleValue=>10.0" << std::endl
 	      << "  --maxFrameShifts intValue=>3" << std::endl
               << "  --progress [no yes]" << std::endl
+              << "  --threads intValue=>1 [default: all cpus available]" << std::endl
               << "  --nt-debug directory" << std::endl
 	      << "Output: The alignment will be printed to standard out and any progress or error messages will be printed to the standard error. This output can be redirected to files, e.g.:" << std::endl
               << "   virulign ref.xml sequence.fasta > alignment.mutations 2> alignment.err" << std::endl;
@@ -85,6 +93,8 @@ int main(int argc, char **argv) {
   int maxFrameShifts = 3;
 
   bool progress = false;
+
+  int threads = -1;
 
   std::string ntDebugDir;
 	
@@ -160,7 +170,20 @@ int main(int argc, char **argv) {
       } else {
 	std::cerr << "Unkown value " << parameterValue << " for parameter : " << parameterName << std::endl; 
 	exit(0);
-      } 
+      }
+    } else if(equalsString(parameterName,"--threads")) {
+      try {
+        threads = lexical_cast<int>(parameterValue);
+        if(threads > 0) {
+          #ifdef _OPENMP
+            omp_set_dynamic(0);
+            omp_set_num_threads(threads);
+          #endif
+        }
+      } catch (std::bad_cast& e) {
+        std::cerr << "Unkown value " << parameterValue << " for parameter : " << parameterName << std::endl;
+        exit(0);
+      }
     } else if(equalsString(parameterName,"--nt-debug")) {
       ntDebugDir = parameterValue;  
     } else {
@@ -170,6 +193,7 @@ int main(int argc, char **argv) {
   }
 	
   std::vector<Alignment> results;
+  results.resize(targets.size());
  
   seq::NeedlemanWunsh algorithm(-gapOpenPenalty, -gapExtensionPenalty);
 
@@ -187,21 +211,32 @@ int main(int argc, char **argv) {
     }
   }
 
-  long int start = current_time_ms();
-  
-  for (i = 0; i < targets.size(); ++i) {
-    std::cerr << "Align target " << i 
-            << " (" << targets[i].name() << ")" << std::endl;
-    results.push_back(Alignment::compute(refSeq, targets[i], &algorithm, maxFrameShifts));
-    if (progress) {
-      long int end = current_time_ms();
-      long int elapsed = end - start;
-      double time_per_seq = (double)elapsed / (i + 1);
-      double estimated_time_left = time_per_seq * (targets.size() - (i + 1));
+  indicators::show_console_cursor(false);
 
-      std::cerr << "Progress: " << (i + 1) << "/" << targets.size() << " sequences aligned (" << std::fixed << std::setprecision(2) << (i + 1) / (double)targets.size() * 100 << "%), Estimated time left " <<  format_time(estimated_time_left) << std::endl;
+  indicators::ProgressBar bar{indicators::option::BarWidth{50},
+                              indicators::option::Start{" ["},
+                              indicators::option::Fill{"#"},
+                              indicators::option::Lead{"#"},
+                              indicators::option::Remainder{" "},
+                              indicators::option::End{"]"},
+                              indicators::option::PrefixText{"Aligning targets"},
+                              indicators::option::ShowElapsedTime{true},
+                              indicators::option::ShowRemainingTime{true},
+                              indicators::option::MaxProgress{targets.size()}};
+  
+  #pragma omp parallel for
+  for (i = 0; i < targets.size(); ++i) {
+    results[i] = Alignment::compute(refSeq, targets[i], &algorithm, maxFrameShifts);
+    if (progress) {
+      bar.tick();
+    } else {
+      std::cerr << "Align target " << i
+                << " (" << targets[i].name() << ")" << std::endl;
     }
   }
+
+  // Show cursor
+  indicators::show_console_cursor(true);
 
   ResultsExporter exporter(results, exportKind, exportAlphabet, exportWithInsertions);
 
